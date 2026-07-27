@@ -115,6 +115,9 @@ private:
 
     std::string _get_header_full_path(const TabletSharedPtr& ref_tablet, const std::string& schema_hash_path) const;
 
+    static Status _flatten_inverted_index_directories(const std::string& snapshot_dir);
+    static Status _restore_inverted_index_directories(const std::string& clone_dir);
+
     Status _rename_rowset_id(const RowsetMetaPB& rs_meta_pb, const string& new_path, TabletSchemaCSPtr& tablet_schema,
                              const RowsetId& next_id, RowsetMetaPB* new_rs_meta_pb);
 

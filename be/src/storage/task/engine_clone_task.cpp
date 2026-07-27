@@ -57,6 +57,7 @@
 #include "runtime/current_thread.h"
 #include "runtime/exec_env.h"
 #include "service/backend_options.h"
+#include "storage/index/index_descriptor.h"
 #include "storage/rowset/rowset.h"
 #include "storage/rowset/rowset_factory.h"
 #include "storage/snapshot_manager.h"
@@ -80,6 +81,64 @@ const std::string HTTP_REQUEST_PREFIX = "/api/_tablet/_download";
 const uint32_t DOWNLOAD_FILE_MAX_RETRY = 3;
 const uint32_t LIST_REMOTE_FILE_TIMEOUT = 15;
 const uint32_t GET_LENGTH_TIMEOUT = 10;
+
+namespace {
+
+Status move_inverted_index_directories(const SnapshotMeta& snapshot_meta, const TabletSchemaCSPtr& tablet_schema,
+                                       const std::string& clone_dir, const std::string& tablet_dir,
+                                       std::set<std::string>* moved_index_dirs) {
+    if (tablet_schema->indexes()->empty()) {
+        return Status::OK();
+    }
+
+    std::vector<std::pair<std::string, std::string>> moved_paths;
+    CancelableDefer rollback([&]() {
+        for (auto it = moved_paths.rbegin(); it != moved_paths.rend(); ++it) {
+            auto st = FileSystem::Default()->rename_file(it->second, it->first);
+            LOG_IF(WARNING, !st.ok()) << "Fail to roll back inverted index directory from " << it->second << " to "
+                                      << it->first << ": " << st;
+        }
+    });
+
+    for (const auto& rowset_meta : snapshot_meta.rowset_metas()) {
+        for (int segment_id = 0; segment_id < rowset_meta.num_segments(); ++segment_id) {
+            for (const auto& index : *tablet_schema->indexes()) {
+                if (index.index_type() != GIN) {
+                    continue;
+                }
+
+                const std::string source = IndexDescriptor::inverted_index_file_path(clone_dir, rowset_meta.rowset_id(),
+                                                                                     segment_id, index.index_id());
+                auto is_dir = fs::is_directory(source);
+                RETURN_IF_ERROR(is_dir.status());
+                if (!is_dir.value()) {
+                    return Status::InternalError("inverted index path is not a directory: " + source);
+                }
+
+                const std::string destination = IndexDescriptor::inverted_index_file_path(
+                        tablet_dir, rowset_meta.rowset_id(), segment_id, index.index_id());
+                auto destination_status = FileSystem::Default()->path_exists(destination);
+                if (destination_status.ok()) {
+                    return Status::AlreadyExist("inverted index directory already exists: " + destination);
+                }
+                if (!destination_status.is_not_found()) {
+                    return destination_status;
+                }
+
+                RETURN_IF_ERROR(FileSystem::Default()->rename_file(source, destination));
+                moved_paths.emplace_back(source, destination);
+            }
+        }
+    }
+
+    for (const auto& moved_path : moved_paths) {
+        moved_index_dirs->insert(moved_path.second);
+    }
+    rollback.cancel();
+    return Status::OK();
+}
+
+} // namespace
 
 EngineCloneTask::EngineCloneTask(MemTracker* mem_tracker, const TCloneReq& clone_req, int64_t signature,
                                  std::vector<string>* error_msgs, std::vector<TTabletInfo>* tablet_infos,
@@ -988,25 +1047,47 @@ Status EngineCloneTask::_finish_clone_primary(Tablet* tablet, const std::string&
 
     auto fs = FileSystem::Default();
     std::set<std::string> tablet_files;
+    std::set<std::string> tablet_index_dirs;
+    auto cleanup_linked_snapshot = [&]() {
+        for (const auto& filename : tablet_files) {
+            auto st = fs->delete_file(filename);
+            LOG_IF(WARNING, !st.ok() && !st.is_not_found()) << "Fail to remove tablet file " << filename << ": " << st;
+        }
+        for (const auto& index_dir : tablet_index_dirs) {
+            auto st = fs::remove_all(index_dir);
+            LOG_IF(WARNING, !st.ok() && !st.is_not_found())
+                    << "Fail to remove tablet index directory " << index_dir << ": " << st;
+        }
+    };
+
     for (const std::string& filename : clone_files) {
         std::string from = clone_dir + "/" + filename;
         std::string to = tablet_dir + "/" + filename;
+        auto st = fs->link_file(from, to);
+        if (!st.ok()) {
+            cleanup_linked_snapshot();
+            return st;
+        }
         tablet_files.insert(to);
-        RETURN_IF_ERROR(fs->link_file(from, to));
     }
     LOG(INFO) << "Linked " << clone_files.size() << " files from " << clone_dir << " to " << tablet_dir;
+
+    auto move_index_st = move_inverted_index_directories(snapshot_meta, tablet->tablet_schema(), clone_dir, tablet_dir,
+                                                         &tablet_index_dirs);
+    if (!move_index_st.ok()) {
+        cleanup_linked_snapshot();
+        return move_index_st;
+    }
+    LOG(INFO) << "Moved " << tablet_index_dirs.size() << " inverted index directories from " << clone_dir << " to "
+              << tablet_dir;
+
     bool need_rebuild_pk_index = _clone_req.__isset.need_rebuild_pk_index && _clone_req.need_rebuild_pk_index;
     // Note that |snapshot_meta| may be modified by `load_snapshot`.
     Status st = tablet->updates()->load_snapshot(snapshot_meta, false, false, need_rebuild_pk_index,
                                                  config::pindex_rebuild_clone_wait_seconds);
     if (!st.ok()) {
-        Status clear_st;
-        for (const std::string& filename : tablet_files) {
-            clear_st = fs::delete_file(filename);
-            if (!clear_st.ok()) {
-                LOG(WARNING) << "remove tablet file:" << filename << " failed, status:" << clear_st;
-            }
-        }
+        cleanup_linked_snapshot();
+        return st;
     }
 
     int64_t expired_stale_sweep_endtime = UnixSeconds() - config::tablet_rowset_stale_sweep_time_sec;
