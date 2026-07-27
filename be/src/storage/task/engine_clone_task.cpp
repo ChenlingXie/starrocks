@@ -84,9 +84,32 @@ const uint32_t GET_LENGTH_TIMEOUT = 10;
 
 namespace {
 
-Status move_inverted_index_directories(const SnapshotMeta& snapshot_meta, const TabletSchemaCSPtr& tablet_schema,
-                                       const std::string& clone_dir, const std::string& tablet_dir,
-                                       std::set<std::string>* moved_index_dirs) {
+struct RowsetIndexLayout {
+    std::string rowset_id;
+    int32_t num_segments;
+};
+
+std::vector<RowsetIndexLayout> get_rowset_index_layouts(const SnapshotMeta& snapshot_meta) {
+    std::vector<RowsetIndexLayout> layouts;
+    layouts.reserve(snapshot_meta.rowset_metas().size());
+    for (const auto& rowset_meta : snapshot_meta.rowset_metas()) {
+        layouts.emplace_back(rowset_meta.rowset_id(), rowset_meta.num_segments());
+    }
+    return layouts;
+}
+
+std::vector<RowsetIndexLayout> get_rowset_index_layouts(const std::vector<RowsetMetaSharedPtr>& rowset_metas) {
+    std::vector<RowsetIndexLayout> layouts;
+    layouts.reserve(rowset_metas.size());
+    for (const auto& rowset_meta : rowset_metas) {
+        layouts.emplace_back(rowset_meta->rowset_id().to_string(), rowset_meta->num_segments());
+    }
+    return layouts;
+}
+
+Status move_inverted_index_directories(const std::vector<RowsetIndexLayout>& rowset_layouts,
+                                       const TabletSchemaCSPtr& tablet_schema, const std::string& clone_dir,
+                                       const std::string& tablet_dir, std::set<std::string>* moved_index_dirs) {
     if (tablet_schema->indexes()->empty()) {
         return Status::OK();
     }
@@ -100,14 +123,14 @@ Status move_inverted_index_directories(const SnapshotMeta& snapshot_meta, const 
         }
     });
 
-    for (const auto& rowset_meta : snapshot_meta.rowset_metas()) {
-        for (int segment_id = 0; segment_id < rowset_meta.num_segments(); ++segment_id) {
+    for (const auto& rowset_layout : rowset_layouts) {
+        for (int segment_id = 0; segment_id < rowset_layout.num_segments; ++segment_id) {
             for (const auto& index : *tablet_schema->indexes()) {
                 if (index.index_type() != GIN) {
                     continue;
                 }
 
-                const std::string source = IndexDescriptor::inverted_index_file_path(clone_dir, rowset_meta.rowset_id(),
+                const std::string source = IndexDescriptor::inverted_index_file_path(clone_dir, rowset_layout.rowset_id,
                                                                                      segment_id, index.index_id());
                 auto is_dir = fs::is_directory(source);
                 RETURN_IF_ERROR(is_dir.status());
@@ -116,7 +139,7 @@ Status move_inverted_index_directories(const SnapshotMeta& snapshot_meta, const 
                 }
 
                 const std::string destination = IndexDescriptor::inverted_index_file_path(
-                        tablet_dir, rowset_meta.rowset_id(), segment_id, index.index_id());
+                        tablet_dir, rowset_layout.rowset_id, segment_id, index.index_id());
                 auto destination_status = FileSystem::Default()->path_exists(destination);
                 if (destination_status.ok()) {
                     return Status::AlreadyExist("inverted index directory already exists: " + destination);
@@ -734,6 +757,15 @@ Status EngineCloneTask::_finish_clone(Tablet* tablet, const string& clone_dir, i
     }
     Status res;
     std::vector<std::string> linked_success_files;
+    std::set<std::string> moved_index_dirs;
+    auto cleanup_unpublished_files = CancelableDefer([&]() {
+        (void)fs::remove(linked_success_files);
+        for (const auto& index_dir : moved_index_dirs) {
+            auto st = fs::remove_all(index_dir);
+            LOG_IF(WARNING, !st.ok() && !st.is_not_found())
+                    << "Fail to remove tablet index directory " << index_dir << ": " << st;
+        }
+    });
 
     // clone and compaction operation should be performed sequentially
     tablet->obtain_base_compaction_lock();
@@ -818,15 +850,29 @@ Status EngineCloneTask::_finish_clone(Tablet* tablet, const string& clone_dir, i
         }
         LOG(INFO) << "Linked " << clone_files.size() << " files from " << clone_dir << " to " << tablet_dir;
 
+        const auto& rowset_metas =
+                incremental_clone ? cloned_tablet_meta.all_inc_rs_metas() : cloned_tablet_meta.all_rs_metas();
+        res = move_inverted_index_directories(get_rowset_index_layouts(rowset_metas), tablet->tablet_schema(),
+                                              clone_dir, tablet_dir, &moved_index_dirs);
+        if (!res.ok()) {
+            break;
+        }
+        LOG(INFO) << "Moved " << moved_index_dirs.size() << " inverted index directories from " << clone_dir << " to "
+                  << tablet_dir;
+
         std::vector<RowsetMetaSharedPtr> rs_to_clone;
         if (incremental_clone) {
             res = _clone_incremental_data(tablet, cloned_tablet_meta, committed_version);
         } else {
             res = _clone_full_data(tablet, const_cast<TabletMeta*>(&cloned_tablet_meta), rs_to_clone);
         }
+        if (!res.ok()) {
+            break;
+        }
+        cleanup_unpublished_files.cancel();
 
         // if full clone success, need to update cumulative layer point
-        if (!incremental_clone && res.ok()) {
+        if (!incremental_clone) {
             tablet->set_cumulative_layer_point(-1);
         }
 
@@ -867,11 +913,6 @@ Status EngineCloneTask::_finish_clone(Tablet* tablet, const string& clone_dir, i
             }
         }
     } while (false);
-
-    // clear linked files if errors happen
-    if (!res.ok()) {
-        (void)fs::remove(linked_success_files);
-    }
 
     return res;
 }
@@ -1072,8 +1113,9 @@ Status EngineCloneTask::_finish_clone_primary(Tablet* tablet, const std::string&
     }
     LOG(INFO) << "Linked " << clone_files.size() << " files from " << clone_dir << " to " << tablet_dir;
 
-    auto move_index_st = move_inverted_index_directories(snapshot_meta, tablet->tablet_schema(), clone_dir, tablet_dir,
-                                                         &tablet_index_dirs);
+    auto move_index_st =
+            move_inverted_index_directories(get_rowset_index_layouts(snapshot_meta), tablet->tablet_schema(), clone_dir,
+                                            tablet_dir, &tablet_index_dirs);
     if (!move_index_st.ok()) {
         cleanup_linked_snapshot();
         return move_index_st;
