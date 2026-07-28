@@ -57,7 +57,6 @@
 #include "runtime/current_thread.h"
 #include "runtime/exec_env.h"
 #include "service/backend_options.h"
-#include "storage/index/index_descriptor.h"
 #include "storage/rowset/rowset.h"
 #include "storage/rowset/rowset_factory.h"
 #include "storage/snapshot_manager.h"
@@ -81,87 +80,6 @@ const std::string HTTP_REQUEST_PREFIX = "/api/_tablet/_download";
 const uint32_t DOWNLOAD_FILE_MAX_RETRY = 3;
 const uint32_t LIST_REMOTE_FILE_TIMEOUT = 15;
 const uint32_t GET_LENGTH_TIMEOUT = 10;
-
-namespace {
-
-struct RowsetIndexLayout {
-    std::string rowset_id;
-    int32_t num_segments;
-};
-
-std::vector<RowsetIndexLayout> get_rowset_index_layouts(const SnapshotMeta& snapshot_meta) {
-    std::vector<RowsetIndexLayout> layouts;
-    layouts.reserve(snapshot_meta.rowset_metas().size());
-    for (const auto& rowset_meta : snapshot_meta.rowset_metas()) {
-        layouts.emplace_back(rowset_meta.rowset_id(), rowset_meta.num_segments());
-    }
-    return layouts;
-}
-
-std::vector<RowsetIndexLayout> get_rowset_index_layouts(const std::vector<RowsetMetaSharedPtr>& rowset_metas) {
-    std::vector<RowsetIndexLayout> layouts;
-    layouts.reserve(rowset_metas.size());
-    for (const auto& rowset_meta : rowset_metas) {
-        layouts.emplace_back(rowset_meta->rowset_id().to_string(), rowset_meta->num_segments());
-    }
-    return layouts;
-}
-
-Status move_inverted_index_directories(const std::vector<RowsetIndexLayout>& rowset_layouts,
-                                       const TabletSchemaCSPtr& tablet_schema, const std::string& clone_dir,
-                                       const std::string& tablet_dir, std::set<std::string>* moved_index_dirs) {
-    if (tablet_schema->indexes()->empty()) {
-        return Status::OK();
-    }
-
-    std::vector<std::pair<std::string, std::string>> moved_paths;
-    CancelableDefer rollback([&]() {
-        for (auto it = moved_paths.rbegin(); it != moved_paths.rend(); ++it) {
-            auto st = FileSystem::Default()->rename_file(it->second, it->first);
-            LOG_IF(WARNING, !st.ok()) << "Fail to roll back inverted index directory from " << it->second << " to "
-                                      << it->first << ": " << st;
-        }
-    });
-
-    for (const auto& rowset_layout : rowset_layouts) {
-        for (int segment_id = 0; segment_id < rowset_layout.num_segments; ++segment_id) {
-            for (const auto& index : *tablet_schema->indexes()) {
-                if (index.index_type() != GIN) {
-                    continue;
-                }
-
-                const std::string source = IndexDescriptor::inverted_index_file_path(clone_dir, rowset_layout.rowset_id,
-                                                                                     segment_id, index.index_id());
-                auto is_dir = fs::is_directory(source);
-                RETURN_IF_ERROR(is_dir.status());
-                if (!is_dir.value()) {
-                    return Status::InternalError("inverted index path is not a directory: " + source);
-                }
-
-                const std::string destination = IndexDescriptor::inverted_index_file_path(
-                        tablet_dir, rowset_layout.rowset_id, segment_id, index.index_id());
-                auto destination_status = FileSystem::Default()->path_exists(destination);
-                if (destination_status.ok()) {
-                    return Status::AlreadyExist("inverted index directory already exists: " + destination);
-                }
-                if (!destination_status.is_not_found()) {
-                    return destination_status;
-                }
-
-                RETURN_IF_ERROR(FileSystem::Default()->rename_file(source, destination));
-                moved_paths.emplace_back(source, destination);
-            }
-        }
-    }
-
-    for (const auto& moved_path : moved_paths) {
-        moved_index_dirs->insert(moved_path.second);
-    }
-    rollback.cancel();
-    return Status::OK();
-}
-
-} // namespace
 
 EngineCloneTask::EngineCloneTask(MemTracker* mem_tracker, const TCloneReq& clone_req, int64_t signature,
                                  std::vector<string>* error_msgs, std::vector<TTabletInfo>* tablet_infos,
@@ -757,15 +675,6 @@ Status EngineCloneTask::_finish_clone(Tablet* tablet, const string& clone_dir, i
     }
     Status res;
     std::vector<std::string> linked_success_files;
-    std::set<std::string> moved_index_dirs;
-    auto cleanup_unpublished_files = CancelableDefer([&]() {
-        (void)fs::remove(linked_success_files);
-        for (const auto& index_dir : moved_index_dirs) {
-            auto st = fs::remove_all(index_dir);
-            LOG_IF(WARNING, !st.ok() && !st.is_not_found())
-                    << "Fail to remove tablet index directory " << index_dir << ": " << st;
-        }
-    });
 
     // clone and compaction operation should be performed sequentially
     tablet->obtain_base_compaction_lock();
@@ -779,6 +688,20 @@ Status EngineCloneTask::_finish_clone(Tablet* tablet, const string& clone_dir, i
 
     tablet->obtain_header_wrlock();
     DeferOp header_wrlock_release_guard([&tablet]() { tablet->release_header_lock(); });
+
+    std::set<std::string> linked_index_dirs;
+    auto cleanup_unpublished_files = CancelableDefer([&]() {
+        for (const auto& linked_file : linked_success_files) {
+            auto st = FileSystem::Default()->delete_file(linked_file);
+            LOG_IF(WARNING, !st.ok() && !st.is_not_found())
+                    << "Fail to remove tablet file " << linked_file << ": " << st;
+        }
+        for (const auto& index_dir : linked_index_dirs) {
+            auto st = fs::remove_all(index_dir);
+            LOG_IF(WARNING, !st.ok() && !st.is_not_found())
+                    << "Fail to remove tablet index directory " << index_dir << ": " << st;
+        }
+    });
 
     do {
         // load src header
@@ -852,12 +775,12 @@ Status EngineCloneTask::_finish_clone(Tablet* tablet, const string& clone_dir, i
 
         const auto& rowset_metas =
                 incremental_clone ? cloned_tablet_meta.all_inc_rs_metas() : cloned_tablet_meta.all_rs_metas();
-        res = move_inverted_index_directories(get_rowset_index_layouts(rowset_metas), tablet->tablet_schema(),
-                                              clone_dir, tablet_dir, &moved_index_dirs);
+        res = SnapshotManager::instance()->link_inverted_index_directories(rowset_metas, tablet->tablet_schema(),
+                                                                           clone_dir, tablet_dir, &linked_index_dirs);
         if (!res.ok()) {
             break;
         }
-        LOG(INFO) << "Moved " << moved_index_dirs.size() << " inverted index directories from " << clone_dir << " to "
+        LOG(INFO) << "Linked " << linked_index_dirs.size() << " inverted index directories from " << clone_dir << " to "
                   << tablet_dir;
 
         std::vector<RowsetMetaSharedPtr> rs_to_clone;
@@ -1113,14 +1036,13 @@ Status EngineCloneTask::_finish_clone_primary(Tablet* tablet, const std::string&
     }
     LOG(INFO) << "Linked " << clone_files.size() << " files from " << clone_dir << " to " << tablet_dir;
 
-    auto move_index_st =
-            move_inverted_index_directories(get_rowset_index_layouts(snapshot_meta), tablet->tablet_schema(), clone_dir,
-                                            tablet_dir, &tablet_index_dirs);
-    if (!move_index_st.ok()) {
+    auto link_index_st = SnapshotManager::instance()->link_inverted_index_directories(
+            snapshot_meta, tablet->tablet_schema(), clone_dir, tablet_dir, &tablet_index_dirs);
+    if (!link_index_st.ok()) {
         cleanup_linked_snapshot();
-        return move_index_st;
+        return link_index_st;
     }
-    LOG(INFO) << "Moved " << tablet_index_dirs.size() << " inverted index directories from " << clone_dir << " to "
+    LOG(INFO) << "Linked " << tablet_index_dirs.size() << " inverted index directories from " << clone_dir << " to "
               << tablet_dir;
 
     bool need_rebuild_pk_index = _clone_req.__isset.need_rebuild_pk_index && _clone_req.need_rebuild_pk_index;
