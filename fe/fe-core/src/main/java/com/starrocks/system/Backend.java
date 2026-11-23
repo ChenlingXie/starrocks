@@ -40,11 +40,13 @@ import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
+import com.google.gson.JsonObject;
 import com.google.gson.annotations.SerializedName;
 import com.starrocks.catalog.DiskInfo;
 import com.starrocks.catalog.DiskInfo.DiskState;
 import com.starrocks.common.DdlException;
 import com.starrocks.common.Pair;
+import com.starrocks.common.util.TimeUtils;
 import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.thrift.TDisk;
 import com.starrocks.thrift.TStorageMedium;
@@ -478,16 +480,20 @@ public class Backend extends ComputeNode {
                         && diskInfo.getState() == DiskState.DECOMMISSIONED);
     }
 
-    /**
-     * Note: This class must be a POJO in order to display in JSON format
-     * Add additional information in the class to show in `show backends`
-     * if just change new added backendStatus, you can do like following
-     * BackendStatus status = Backend.getBackendStatus();
-     * status.newItem = xxx;
-     */
     public static class BackendStatus {
-        // this will be output as json, so not using FeConstants.null_string;
-        public String lastSuccessReportTabletsTime = "N/A";
+        // Epoch milliseconds. Zero indicates that no tablet report has completed.
+        public volatile long lastSuccessReportTabletsTimeMs;
+
+        public String getLastSuccessReportTabletsTimeStr() {
+            long reportTimeMs = lastSuccessReportTabletsTimeMs;
+            return reportTimeMs == 0L ? "N/A" : TimeUtils.longToTimeString(reportTimeMs);
+        }
+
+        public String toShowBackendsJson() {
+            JsonObject status = new JsonObject();
+            status.addProperty("lastSuccessReportTabletsTime", getLastSuccessReportTabletsTimeStr());
+            return status.toString();
+        }
     }
 }
 

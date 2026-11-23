@@ -97,7 +97,7 @@ public class BackendAction extends WebBaseAction {
                     + ", brpc_port: " + backend.getBrpcPort()
                     + ", state: " + backend.getBackendState()
                     + ", start_time: " + TimeUtils.longToTimeString(backend.getLastStartTime())
-                    + ", last_report_tablets_time: " + backend.getBackendStatus().lastSuccessReportTabletsTime
+                    + ", last_report_tablets_time: " + backend.getBackendStatus().getLastSuccessReportTabletsTimeStr()
                     + ", version: " + backend.getVersion());
 
             backendInfos.add(backendInfo);
